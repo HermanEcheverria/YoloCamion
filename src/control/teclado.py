@@ -14,7 +14,10 @@ lo que simula control analógico con teclas binarias.
 import logging
 import time
 
-import pydirectinput
+try:
+    import pydirectinput
+except ImportError:
+    pydirectinput = None  # solo disponible en Windows
 
 from src.tipos import ComandoControl
 from src.control.base import Controlador

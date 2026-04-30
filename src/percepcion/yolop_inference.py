@@ -165,4 +165,11 @@ class InferenciaYOLOP:
         ll_seg_mask = ll_predict.byte().cpu().numpy()[0]
         ll_seg_mask = cv2.resize(ll_seg_mask, (shape_orig[1], shape_orig[0]), interpolation=cv2.INTER_NEAREST)
 
+        # Cerrar brechas en las líneas de carril: YOLOP pierde píxeles intermedios
+        # en curvas porque la línea se vuelve oblicua. Un cierre morfológico con
+        # kernel elíptico vertical conecta los segmentos y permite que el ajuste
+        # polinomial tenga suficientes puntos para predecir la trayectoria.
+        _kernel_curva = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 19))
+        ll_seg_mask = cv2.morphologyEx(ll_seg_mask, cv2.MORPH_CLOSE, _kernel_curva)
+
         return detecciones, da_seg_mask, ll_seg_mask

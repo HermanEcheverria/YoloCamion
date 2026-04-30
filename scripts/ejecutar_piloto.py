@@ -295,11 +295,14 @@ def main():
             ll_mask_roi = ll_mask.copy()
             ll_mask_roi[:_fila_roi, :] = 0
 
-            # Pure Pursuit: ll_mask (nivel 1) con fallback a da_mask (nivel 2)
+            # Pure Pursuit: polinomio (1a) → filas (1b) → da_mask (2) → memoria (3)
             giro_pure_pursuit, carril_perdido = pure_pursuit.calcular_giro(da_mask, ll_mask_roi)
 
-            # EMA de suavizado (alpha=0.30 — señal ya más estable que antes)
-            desv_ema = (_ALPHA_EMA_CARRIL * giro_pure_pursuit + (1.0 - _ALPHA_EMA_CARRIL) * desv_ema)
+            # EMA dinámica: alpha sube con la curvatura para reaccionar más rápido
+            # en curvas sin perder suavizado en rectas.
+            # Rango: 0.12 (recta) → 0.35 (curva pronunciada, curvatura≈1).
+            _alpha_curva = _ALPHA_EMA_CARRIL + pure_pursuit.ultima_curvatura * 0.23
+            desv_ema = (_alpha_curva * giro_pure_pursuit + (1.0 - _alpha_curva) * desv_ema)
 
             # ── Velocidad propia visual (pure-vision, RNF-07) ────────────────
             flujo_lk = estimador_flujo.calcular(cuadro.imagen, cuadro.timestamp)
@@ -324,11 +327,13 @@ def main():
                 desviacion_volante=resultado.setpoint.desviacion_volante,
             )
 
-            # Override de carril: activo en estados de conducción normal
-            # Zona muerta ±0.05: suprime micro-correcciones por ruido de detección.
+            # Override de carril: activo en estados de conducción normal.
+            # Zona muerta adaptativa: ±0.05 en recta (filtra ruido de detección),
+            # ±0.02 en curva (permite correcciones finas antes de salirse).
             if (resultado.accion not in _ACCIONES_CON_GIRO
                     and resultado.estado_nuevo in _ESTADOS_CARRIL):
-                desv_out = 0.0 if abs(desv_ema) < 0.05 else float(np.clip(desv_ema, -1.0, 1.0))
+                _zona_muerta = 0.05 - pure_pursuit.ultima_curvatura * 0.03
+                desv_out = 0.0 if abs(desv_ema) < _zona_muerta else float(np.clip(desv_ema, -1.0, 1.0))
                 setpoint.desviacion_volante = desv_out
 
             # Reducir velocidad cuando el carril se pierde por oclusión
@@ -337,9 +342,9 @@ def main():
 
             if args.debug_carril and n_frame % 30 == 0:
                 logger.info(
-                    "CARRIL (YOLOP) desv_pp=%+.3f ema=%+.3f vol=%+.2f vel=%.2f",
-                    giro_pure_pursuit, desv_ema,
-                    setpoint.desviacion_volante, velocidad_actual_norm,
+                    "CARRIL desv_pp=%+.3f ema=%+.3f vol=%+.2f curv=%.2f alpha=%.2f vel=%.2f",
+                    giro_pure_pursuit, desv_ema, setpoint.desviacion_volante,
+                    pure_pursuit.ultima_curvatura, _alpha_curva, velocidad_actual_norm,
                 )
 
             if args.debug_carril_img and n_frame % 60 == 0:
