@@ -18,7 +18,7 @@ class LecturaVelocidadDashboard:
     valido: bool
 
 
-_ROI_DIGITOS = (0.023, 0.844, 0.116, 0.936)  # x1, y1, x2, y2
+_ROI_DIGITOS = (0.0474, 0.9287, 0.0781, 0.9722)  # x1, y1, x2, y2 — solo digitos velocimetro ETS2 1920x1080
 _SIZE_ROI = (80, 45)  # ancho, alto de referencia
 _SIZE_DIGITO = (10, 14)
 
@@ -207,10 +207,27 @@ class EstimadorVelocidadDashboard:
     def estimar(self, frame_bgr: np.ndarray) -> LecturaVelocidadDashboard:
         lectura = self.leer(frame_bgr)
         if lectura.valido and lectura.kmh is not None:
-            self._ultimo_kmh = lectura.kmh
-            self._frames_sin_lectura = 0
-            return lectura
+            # Filtro de plausibilidad: rechaza caídas bruscas que parecen
+            # lecturas parciales del OCR (p.ej. "48" leído como "4").
+            # Acepta si: no hay lectura previa, nuevo >= 15, o nuevo >= 40% del anterior.
+            plausible = (
+                self._ultimo_kmh is None
+                or lectura.kmh >= 15
+                or lectura.kmh >= self._ultimo_kmh * 0.65
+            )
+            if plausible:
+                self._ultimo_kmh = lectura.kmh
+                self._frames_sin_lectura = 0
+                return lectura
 
+            # Lectura implausible (p.ej. "4" cuando íbamos a 44 km/h):
+            # devolver retenedor SIN incrementar frames_sin_lectura para que
+            # el retenedor no expire mientras el OCR sigue leyendo mal.
+            if self._ultimo_kmh is not None:
+                norm = min(1.0, max(0.0, self._ultimo_kmh / self._max_kmh_norm))
+                return LecturaVelocidadDashboard(self._ultimo_kmh, norm, 0.0, False)
+
+        # OCR falló (valido=False o kmh=None): sí consumir el retenedor
         self._frames_sin_lectura += 1
         if self._ultimo_kmh is not None and self._frames_sin_lectura <= self._retener_frames:
             norm = min(1.0, max(0.0, self._ultimo_kmh / self._max_kmh_norm))
@@ -220,7 +237,11 @@ class EstimadorVelocidadDashboard:
     def leer(self, frame_bgr: np.ndarray) -> LecturaVelocidadDashboard:
         roi = self._recortar_roi(frame_bgr)
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        _, mask = cv2.threshold(gray, 165, 255, cv2.THRESH_BINARY)
+        _, mask = cv2.threshold(gray, 130, 255, cv2.THRESH_BINARY)
+
+        # Dilatar para reconectar trazos fragmentados del font digital de ETS2
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        mask = cv2.dilate(mask, kernel, iterations=1)
 
         componentes = self._extraer_componentes(mask)
         if not componentes:
@@ -230,7 +251,7 @@ class EstimadorVelocidadDashboard:
         confs: list[float] = []
         for _x, comp in componentes:
             digito, conf = self._clasificar(comp)
-            if conf < 0.38:
+            if conf < 0.25:
                 continue
             digitos.append(digito)
             confs.append(conf)
@@ -244,7 +265,7 @@ class EstimadorVelocidadDashboard:
 
         confianza = float(np.mean(confs))
         norm = min(1.0, max(0.0, kmh / self._max_kmh_norm))
-        return LecturaVelocidadDashboard(kmh, norm, confianza, confianza >= 0.42)
+        return LecturaVelocidadDashboard(kmh, norm, confianza, confianza >= 0.30)
 
     def _recortar_roi(self, frame_bgr: np.ndarray) -> np.ndarray:
         h, w = frame_bgr.shape[:2]
@@ -261,7 +282,7 @@ class EstimadorVelocidadDashboard:
         componentes: list[tuple[int, np.ndarray]] = []
         for i in range(1, num):
             x, y, w, h, area = (int(v) for v in stats[i])
-            if y < 20 or not (7 <= h <= 20) or not (4 <= w <= 16) or area < 25:
+            if not (5 <= h <= 55) or not (3 <= w <= 45) or area < 12:
                 continue
             comp = mask[y:y + h, x:x + w]
             comp = cv2.resize(comp, _SIZE_DIGITO, interpolation=cv2.INTER_NEAREST)
@@ -274,11 +295,19 @@ class EstimadorVelocidadDashboard:
         vec = (comp.reshape(-1).astype(np.float32) / 255.0)
         mejor_digito = 0
         mejor_score = -1.0
+        segundo_score = -1.0
         for digito, plantilla in _PLANTILLAS.items():
             score = self._score(vec, plantilla)
             if score > mejor_score:
+                segundo_score = mejor_score
                 mejor_score = score
                 mejor_digito = digito
+            elif score > segundo_score:
+                segundo_score = score
+        # Rechazar si la diferencia entre el mejor y segundo candidato es demasiado
+        # pequeña — indica ambigüedad (p.ej. "2" vs "8", "5" vs "6").
+        if mejor_score - segundo_score < 0.10:
+            return mejor_digito, 0.0
         return mejor_digito, float(mejor_score)
 
     @staticmethod

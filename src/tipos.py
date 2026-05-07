@@ -116,4 +116,6 @@ class SetpointControl:
     """
     velocidad_objetivo_norm: float = 0.0   # 0-1; 1 = velocidad máxima permitida
     freno_objetivo: float = 0.0            # 0-1; >=0.9 dispara bypass de emergencia
-    desviacion_volante: float = 0.0        # -1..+1 (signo: <0 izq, >0 der)
+    desviacion_volante: float = 0.0        # -1..+1 (signo: <0 izq, >0 der) — stick command
+    error_carril: float | None = None      # error crudo de PurePursuit (positivo = girar izq)
+                                           # None cuando FSM controla el volante directamente

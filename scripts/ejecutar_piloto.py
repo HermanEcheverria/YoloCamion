@@ -61,7 +61,10 @@ _LIMITE_COMANDO_DA = 0.25
 
 
 def _setpoint_a_comando(sp: SetpointControl) -> ComandoControl:
-    """Adaptador: SetpointControl -> ComandoControl para controladores no-PID."""
+    """Adaptador: SetpointControl -> ComandoControl para controladores no-PID.
+
+    desviacion_volante ya viene como stick command (ganancia e inversión aplicadas).
+    """
     return ComandoControl(
         acelerador=sp.velocidad_objetivo_norm,
         freno=sp.freno_objetivo,
@@ -226,6 +229,7 @@ def main():
     )
     velocidad_actual_norm = 0.0
     velocidad_actual_kmh: int | None = None
+    _vel_estimada: float = 0.0  # estimación suavizada; se usa solo para logging y condiciones de curva
     metricas = MetricasSesion()
     log = LoggerJSONL(cfg["registro"]["ruta_base"])
     grabar = cfg["registro"]["grabar_video"] and not args.sin_video
@@ -269,6 +273,14 @@ def main():
         estado_anterior = fsm.estado_actual
         n_frame = 0
         seguimientos = []    # se actualiza cada YOLO_CADA frames
+
+        # Control bang-bang sobre OCR: acelera si kmh < objetivo, frena si kmh > objetivo.
+        # Si el OCR no tiene lectura válida → gas suave constante (18% RT).
+        _VEL_OBJETIVO_KMH = 35    # km/h de crucero
+        _BANDA_KMH        = 4     # histéresis ±2 km/h (gas <33, freno >37, coast entre)
+        _GAS_CRUCERO      = 0.22  # 22% RT (~56/255) para acelerar
+        _FRENO_CRUCERO    = 0.22  # 22% LT (~56/255) para frenar suave
+        _EMERGENCIA_KMH   = 55    # freno de emergencia solo si OCR lee claramente > 55
         # Cache del último resultado YOLO/FSM — se actualiza cada YOLO_CADA frames
         YOLO_CADA = 3        # YOLO cada 3 frames → ~10 FPS detección, ~30 FPS carril
         yolo_contador = 0
@@ -349,19 +361,26 @@ def main():
             # EMA de suavizado rapido: PurePursuit ya limita saltos grandes.
             desv_ema = (_ALPHA_EMA_CARRIL * giro_pure_pursuit + (1.0 - _ALPHA_EMA_CARRIL) * desv_ema)
 
-            # Cuando el camión está casi parado el volante no produce corrección
-            # lateral efectiva y la EMA acumula sesgo que dispara un sobreimpulso
-            # al retomar la marcha. Por debajo de 5 km/h se decae la EMA a la
-            # mitad por frame para mantener la memoria pequeña.
-            if velocidad_actual_kmh is not None and velocidad_actual_kmh <= 5:
+            # Decay del EMA mientras el camión está detenido para evitar que la
+            # memoria de desviación cause un sobreimpulso de volante al arrancar.
+            # Estados de paro completo: la EMA decae rápido (×0.85 por frame).
+            # A baja velocidad (<5 km/h): decay a la mitad por frame.
+            _estado_fsm_actual = resultado_cache.estado_nuevo if resultado_cache else None
+            _estados_paro = (EstadoFSM.DETENIDO_SEMAFORO, EstadoFSM.DETENIDO_ALTO,
+                             EstadoFSM.PARO_EMERGENCIA)
+            if _estado_fsm_actual in _estados_paro:
+                desv_ema *= 0.85
+            elif velocidad_actual_kmh is not None and velocidad_actual_kmh <= 5:
                 desv_ema *= 0.5
 
-            # ── Velocidad propia desde HUD ──────────────────────────────────
+            # ── Velocidad propia desde HUD (solo para logging) ───────────────
             lectura_velocidad = estimador_velocidad.estimar(cuadro.imagen)
-            velocidad_actual_norm = lectura_velocidad.norm
             velocidad_actual_kmh = lectura_velocidad.kmh
-            if isinstance(controlador, ControladorGamepadPID):
-                controlador.actualizar_velocidad_actual(velocidad_actual_norm)
+            if lectura_velocidad.norm > 0.0:
+                _vel_estimada = lectura_velocidad.norm
+            else:
+                _vel_estimada = max(0.0, _vel_estimada - 0.001)
+            velocidad_actual_norm = _vel_estimada
 
             # ── YOLO + FSM (cada YOLO_CADA frames — lenta ~100ms) ───────────
             yolo_contador += 1
@@ -389,33 +408,55 @@ def main():
                 if comando_carril_directo is not None:
                     setpoint.desviacion_volante = comando_carril_directo
                 else:
-                    desv_out = 0.0 if abs(desv_ema) < _ZONA_MUERTA_CARRIL_PP else float(
-                        np.clip(desv_ema * _GANANCIA_CARRIL_PP, -1.0, 1.0)
-                    )
+                    # Error crudo del carril (positivo = necesita girar izq).
+                    desv_raw = 0.0 if abs(desv_ema) < _ZONA_MUERTA_CARRIL_PP else float(desv_ema)
                     if fuente_carril == "da":
-                        desv_out = float(np.clip(desv_out, -_LIMITE_COMANDO_DA, _LIMITE_COMANDO_DA))
-                    # PurePursuit: positivo = objetivo a la izquierda, negativo = derecha.
-                    # SetpointControl/gamepad: negativo = stick izquierda, positivo = derecha.
-                    setpoint.desviacion_volante = -desv_out
+                        desv_raw = float(np.clip(desv_raw, -_LIMITE_COMANDO_DA, _LIMITE_COMANDO_DA))
+                    # Stick command para controladores no-PID (ganancia + inversión de signo).
+                    setpoint.desviacion_volante = float(
+                        np.clip(-desv_raw * _GANANCIA_CARRIL_PP, -1.0, 1.0)
+                    )
+                    # Error crudo para _pid_vol en ControladorGamepadPID.
+                    setpoint.error_carril = desv_raw
 
-            # Reducir velocidad solo cuando todo falla (nivel 3: decay puro).
-            # Braking solo por encima de 15 km/h para que el camión pueda arrancar.
-            _VEL_FRENO_DECAY = 0.17  # ~15 km/h a 90 km/h max
+            # Reducir velocidad cuando el carril se pierde completamente.
             if carril_perdido and resultado.estado_nuevo in _ESTADOS_CARRIL:
                 setpoint.velocidad_objetivo_norm *= 0.50
-                if velocidad_actual_norm >= _VEL_FRENO_DECAY:
-                    setpoint.freno_objetivo = max(setpoint.freno_objetivo, 0.10)
+                setpoint.freno_objetivo = max(setpoint.freno_objetivo, 0.10)
 
+            # Reducir velocidad en curvas (sin depender del OCR).
             if resultado.estado_nuevo in _ESTADOS_CARRIL:
                 curva = max(abs(giro_pure_pursuit), abs(desv_ema), pure_pursuit.ultima_curvatura_debug)
-                setpoint.velocidad_objetivo_norm *= 0.80
                 if curva > 0.06:
-                    escala_curva = float(np.interp(curva, [0.06, 0.45], [0.85, 0.35]))
+                    escala_curva = float(np.interp(curva, [0.06, 0.45], [0.90, 0.40]))
                     setpoint.velocidad_objetivo_norm *= escala_curva
                 if curva > 0.12:
-                    if velocidad_actual_norm >= _VEL_FRENO_DECAY:
-                        freno_curva = 0.06 if curva < 0.25 else 0.10
-                        setpoint.freno_objetivo = max(setpoint.freno_objetivo, freno_curva)
+                    freno_curva = 0.06 if curva < 0.25 else 0.10
+                    setpoint.freno_objetivo = max(setpoint.freno_objetivo, freno_curva)
+
+            # Bang-bang sobre OCR: acelera/frena según kmh vs objetivo.
+            _fsm_frena = resultado.accion in {
+                Accion.FRENAR_SUAVE, Accion.FRENAR_FUERTE, Accion.ALTO_TOTAL,
+            }
+
+            _ocr_emergencia = velocidad_actual_kmh is not None and velocidad_actual_kmh > _EMERGENCIA_KMH
+            if _ocr_emergencia:
+                setpoint.velocidad_objetivo_norm = 0.0
+                setpoint.freno_objetivo = max(setpoint.freno_objetivo, 0.90)
+            elif resultado.estado_nuevo in _ESTADOS_CARRIL and not _fsm_frena:
+                if velocidad_actual_kmh is None:
+                    # OCR sin lectura → gas suave hasta que el OCR reporte
+                    setpoint.velocidad_objetivo_norm = 0.18
+                    setpoint.freno_objetivo = 0.0
+                elif velocidad_actual_kmh < _VEL_OBJETIVO_KMH - _BANDA_KMH // 2:
+                    # Por debajo del objetivo → acelerar
+                    setpoint.velocidad_objetivo_norm = _GAS_CRUCERO
+                    setpoint.freno_objetivo = 0.0
+                elif velocidad_actual_kmh > _VEL_OBJETIVO_KMH + _BANDA_KMH // 2:
+                    # Por encima del objetivo → frenar suave
+                    setpoint.velocidad_objetivo_norm = 0.0
+                    setpoint.freno_objetivo = _FRENO_CRUCERO
+                # else: dentro de la banda (33–37 km/h) → coast, sin aplicar nada
 
             if args.debug_carril and n_frame % 30 == 0:
                 logger.info(
@@ -526,6 +567,7 @@ def main():
                         "detalle": detalle_carril.strip(),
                         "err": round(float(giro_pure_pursuit), 4),
                         "ema": round(float(desv_ema), 4),
+                        "err_pid": round(float(setpoint.error_carril or 0.0), 4),
                         "cmd": round(float(setpoint.desviacion_volante), 4),
                         "stick": round(float(stick_aplicado), 4),
                         "kmh": velocidad_actual_kmh,

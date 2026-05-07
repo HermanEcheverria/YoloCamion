@@ -55,19 +55,24 @@ class Tracker:
         ids_actuales: set[int] = set()
 
         cajas = resultados[0].boxes
-        if cajas is None or cajas.id is None:
+        if cajas is None or len(cajas) == 0:
             return []
 
-        for caja in cajas:
+        tiene_ids = cajas.id is not None
+
+        for i, caja in enumerate(cajas):
             id_coco = int(caja.cls[0])
             clase = _COCO_A_CLASE.get(id_coco, Clase.DESCONOCIDO)
             x1, y1, x2, y2 = (int(v) for v in caja.xyxy[0])
             area = (x2 - x1) * (y2 - y1)
-            track_id = int(caja.id[0])
+            # Sin IDs de tracking (primer frame): ID temporal negativo para no contaminar edades
+            track_id = int(cajas.id[i]) if tiene_ids else -(i + 1)
 
-            self._edades[track_id] += 1
-            ids_actuales.add(track_id)
+            if tiene_ids:
+                self._edades[track_id] += 1
+                ids_actuales.add(track_id)
 
+            edad = self._edades[track_id] if tiene_ids else 1
             seguimientos.append(
                 Seguimiento(
                     clase=clase,
@@ -75,7 +80,7 @@ class Tracker:
                     confianza=float(caja.conf[0]),
                     area=area,
                     id_seguimiento=track_id,
-                    edad=self._edades[track_id],
+                    edad=edad,
                 )
             )
 

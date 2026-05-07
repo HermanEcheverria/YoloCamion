@@ -9,15 +9,15 @@ fuente:
 modelo:
   pesos: "datos/modelos/yolo11n.pt"   # RF-03: sustituye yolo26n.pt (pendiente); yolo11n es COCO-compatible
   imgsz: 864
-  conf_min: 0.35
+  conf_min: 0.20
   device: "cuda"
 
 control:
   tipo: "gamepad"                 # "nulo" | "gamepad" | "teclado"
 
 velocidad_dashboard:
-  max_kmh_norm: 90.0              # km/h que equivale a velocidad normalizada 1.0
-  retener_frames: 15              # mantener ultima lectura si un frame no se puede leer
+  max_kmh_norm: 60.0              # km/h que equivale a velocidad normalizada 1.0
+  retener_frames: 90              # mantener ultima lectura ~3s a 30fps (evita rt=255 por OCR fallido)
 
 seguridad:
   tecla_paro: "f12"

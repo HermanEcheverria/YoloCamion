@@ -19,6 +19,9 @@ from src.decision.estado import EstadoFSM
 _N_FRAMES_OCUPADO = 4   # frames consecutivos para declarar "ocupado" (~0.4s a 10 FPS YOLO)
 _N_FRAMES_LIBRE   = 18  # frames consecutivos para declarar "libre" (~1.8s a 10 FPS YOLO)
                         # Aumentado de 10 para reducir ciclado R8/R4 por detecciones espurias
+_N_FRAMES_LIBRE_SEMAFORO = 126  # ~9s a 14fps: el semáforo puede salir del FOV al frenar
+                                # bruscamente; el camión permanece detenido hasta que
+                                # se detecte VERDE o pasen ~9s sin ver ROJO
 _T_ESPERA_ALTO    = 2.0  # segundos de parada completa antes de cruzar
 _T_MIN_SIGUIENDO  = 8.0  # segundos mínimos siguiendo antes de evaluar rebase
 
@@ -49,20 +52,19 @@ class _Contador:
         return self.n_negativos >= umbral
 
 
-# Mapa Accion -> setpoint base. La Capa 3 (PID) consume estos valores como
-# objetivos continuos; el PID se encarga de suavizarlos. La desviacion del
-# volante se sobreescribe en el bucle del piloto con la salida del detector
-# de carriles, salvo para acciones con giro intencional (REBASAR_*).
+# Velocidades expresadas como fraccion de max_kmh_norm (90 km/h en config):
+#   MANTENER = ACELERAR = 0.72 ≈ 65 km/h — velocidad de crucero unica
+#   GIRAR     0.22 ≈ 20 km/h             — interseccion / maniobra lenta
 _SETPOINTS: dict[Accion, SetpointControl] = {
-    Accion.MANTENER:      SetpointControl(velocidad_objetivo_norm=0.30, freno_objetivo=0.0,  desviacion_volante=0.0),
-    Accion.ACELERAR:      SetpointControl(velocidad_objetivo_norm=0.60, freno_objetivo=0.0,  desviacion_volante=0.0),
+    Accion.MANTENER:      SetpointControl(velocidad_objetivo_norm=0.08, freno_objetivo=0.0,  desviacion_volante=0.0),
+    Accion.ACELERAR:      SetpointControl(velocidad_objetivo_norm=0.0,  freno_objetivo=0.0,  desviacion_volante=0.0),
     Accion.FRENAR_SUAVE:  SetpointControl(velocidad_objetivo_norm=0.0,  freno_objetivo=0.40, desviacion_volante=0.0),
     Accion.FRENAR_FUERTE: SetpointControl(velocidad_objetivo_norm=0.0,  freno_objetivo=0.80, desviacion_volante=0.0),
     Accion.ALTO_TOTAL:    SetpointControl(velocidad_objetivo_norm=0.0,  freno_objetivo=1.00, desviacion_volante=0.0),
-    Accion.GIRAR_IZQ:     SetpointControl(velocidad_objetivo_norm=0.20, freno_objetivo=0.0,  desviacion_volante=-0.5),
-    Accion.GIRAR_DER:     SetpointControl(velocidad_objetivo_norm=0.20, freno_objetivo=0.0,  desviacion_volante=0.5),
-    Accion.REBASAR_IZQ:   SetpointControl(velocidad_objetivo_norm=0.80, freno_objetivo=0.0,  desviacion_volante=-0.3),
-    Accion.REBASAR_DER:   SetpointControl(velocidad_objetivo_norm=0.80, freno_objetivo=0.0,  desviacion_volante=0.3),
+    Accion.GIRAR_IZQ:     SetpointControl(velocidad_objetivo_norm=0.22, freno_objetivo=0.0,  desviacion_volante=-0.5),
+    Accion.GIRAR_DER:     SetpointControl(velocidad_objetivo_norm=0.22, freno_objetivo=0.0,  desviacion_volante=0.5),
+    Accion.REBASAR_IZQ:   SetpointControl(velocidad_objetivo_norm=0.72, freno_objetivo=0.0,  desviacion_volante=0.0),
+    Accion.REBASAR_DER:   SetpointControl(velocidad_objetivo_norm=0.72, freno_objetivo=0.0,  desviacion_volante=0.0),
     Accion.ESPERAR:       SetpointControl(velocidad_objetivo_norm=0.0,  freno_objetivo=0.0,  desviacion_volante=0.0),
 }
 
@@ -94,15 +96,16 @@ class FSMDecision:
         self._paro_manual = False
 
         # Contadores de histéresis por región
-        self._c_frente_cercano = _Contador()
-        self._c_frente_lejano  = _Contador()
-        self._c_peaton         = _Contador()
-        self._c_espejo_izq     = _Contador()
-        self._c_espejo_der     = _Contador()
-        self._c_semaforo_rojo  = _Contador()
-        self._c_semaforo_verde = _Contador()
-        self._c_senal_alto     = _Contador()
-        self._c_confianza_baja = _Contador()
+        self._c_frente_cercano   = _Contador()
+        self._c_frente_lejano    = _Contador()
+        self._c_peaton           = _Contador()
+        self._c_espejo_izq       = _Contador()
+        self._c_espejo_der       = _Contador()
+        self._c_semaforo_rojo    = _Contador()
+        self._c_semaforo_amarillo = _Contador()
+        self._c_semaforo_verde   = _Contador()
+        self._c_senal_alto       = _Contador()
+        self._c_confianza_baja   = _Contador()
 
         # Timers
         self._t_inicio_alto: Optional[float] = None
@@ -129,6 +132,7 @@ class FSMDecision:
         self._c_espejo_izq.actualizar(escena.espejo_izq_ocupado)
         self._c_espejo_der.actualizar(escena.espejo_der_ocupado)
         self._c_semaforo_rojo.actualizar(escena.semaforo_visible == EstadoSemaforo.ROJO)
+        self._c_semaforo_amarillo.actualizar(escena.semaforo_visible == EstadoSemaforo.AMARILLO)
         self._c_semaforo_verde.actualizar(escena.semaforo_visible == EstadoSemaforo.VERDE)
         self._c_senal_alto.actualizar(escena.senal_alto_cercana)
         self._c_confianza_baja.actualizar(escena.confianza_percepcion < 0.3)
@@ -174,13 +178,15 @@ class FSMDecision:
             )
 
         # Regla 4 — Semáforo rojo → detenerse (RF-07)
-        # Stickiness: si ya estamos en DETENIDO_SEMAFORO, mantenemos el
-        # alto hasta que el contador acumule _N_FRAMES_LIBRE negativos
-        # consecutivos, evitando que un solo frame sin detección relance
-        # el camión (patrón "frena 0.5s, arranca, frena" observado en pruebas).
+        # Stickiness larga: al frenar bruscamente el semáforo puede salir del FOV
+        # antes de ponerse verde (el camión sobrepasa la línea de parada).
+        # Permanecemos en DETENIDO_SEMAFORO hasta que:
+        #   a) se detecte VERDE activo  (escape rápido cuando sí lo vemos), o
+        #   b) pasen _N_FRAMES_LIBRE_SEMAFORO frames sin ROJO (~9s a 14fps)
         _semaforo_rojo_sticky = self._c_semaforo_rojo.esta_activo() or (
             self._estado == EstadoFSM.DETENIDO_SEMAFORO
-            and not self._c_semaforo_rojo.esta_inactivo()
+            and self._c_semaforo_rojo.n_negativos < _N_FRAMES_LIBRE_SEMAFORO
+            and not self._c_semaforo_verde.esta_activo()
         )
         if _semaforo_rojo_sticky:
             return ResultadoDecision(
@@ -189,7 +195,7 @@ class FSMDecision:
             )
 
         # Regla 5 — Semáforo amarillo → frenar suave si no estamos detenidos
-        if (escena.semaforo_visible == EstadoSemaforo.AMARILLO
+        if (self._c_semaforo_amarillo.esta_activo()
                 and self._estado != EstadoFSM.DETENIDO_SEMAFORO):
             return ResultadoDecision(
                 Accion.FRENAR_SUAVE, EstadoFSM.APROXIMANDO_SEMAFORO,
@@ -242,21 +248,9 @@ class FSMDecision:
                 10, "conflicto lateral durante rebase — abortando"
             )
 
-        # Regla 9 — Siguiendo >_T_MIN_SIGUIENDO s + espejo izq libre + TTC bajo → iniciar rebase (RF-09)
-        # Evaluado ANTES de R8 para que pueda disparar cuando las condiciones son correctas.
-        # Refinamiento R9b: rebasar solo cuando el frente realmente nos demora
-        # (TTC < _TTC_REBASE_OK). Si TTC alto, vamos a velocidad similar; rebasar
-        # seria gratuito y peligroso.
-        if (self._estado == EstadoFSM.SIGUIENDO_VEHICULO
-                and self._t_siguiendo_desde is not None
-                and (time.monotonic() - self._t_siguiendo_desde) >= _T_MIN_SIGUIENDO
-                and self._c_espejo_izq.esta_inactivo()
-                and not escena.espejo_izq_ocupado
-                and ttc < _TTC_REBASE_OK):
-            return ResultadoDecision(
-                Accion.REBASAR_IZQ, EstadoFSM.REBASANDO,
-                9, f"condiciones de rebase cumplidas (TTC={ttc:.2f}s)"
-            )
+        # Regla 9 — Rebase deshabilitado: el camion mantiene distancia indefinidamente.
+        # (Anteriormente iniciaba rebase tras _T_MIN_SIGUIENDO s. Desactivado para
+        # simplificar el comportamiento en demo — la FSM retorna a R8 directamente.)
 
         # Regla 8 — Frente cercano ocupado → tres tiers segun TTC visual (R8b)
         # Stickiness: si ya estamos en SIGUIENDO_VEHICULO, mantenemos el

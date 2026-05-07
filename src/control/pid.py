@@ -33,6 +33,7 @@ class PIDController:
 
         self._integral: float = 0.0
         self._error_anterior: float = 0.0
+        self._primera_llamada: bool = True  # evita spike D en primer frame
 
     def calcular(self, setpoint: float, medicion: float, dt: float) -> float:
         if dt <= 0:
@@ -48,13 +49,16 @@ class PIDController:
         if self._ki != 0.0:
             i_raw = self._ki * self._integral
             if abs(i_raw) > self._limite:
-                # Recortar la integral para que su aporte no supere el limite
                 signo = 1.0 if i_raw > 0 else -1.0
                 self._integral = signo * self._limite / self._ki
         i = self._ki * self._integral
 
-        # D sobre el error (no sobre la medicion)
-        d = self._kd * (error - self._error_anterior) / dt
+        # D — se omite en la primera llamada (evita el spike por error_anterior=0)
+        if self._primera_llamada:
+            d = 0.0
+            self._primera_llamada = False
+        else:
+            d = self._kd * (error - self._error_anterior) / dt
         self._error_anterior = error
 
         salida = p + i + d
@@ -64,6 +68,7 @@ class PIDController:
             return -self._limite
         return salida
 
-    def reset(self) -> None:
+    def reset(self, error_inicial: float = 0.0) -> None:
         self._integral = 0.0
-        self._error_anterior = 0.0
+        self._error_anterior = error_inicial
+        self._primera_llamada = True

@@ -31,7 +31,7 @@ class PurePursuitVisual:
     _ALPHA_ANCLA_CARRIL = 0.15  # velocidad de actualización del ancla de carril
     _VENTANA_CARRIL_FRAC = 0.20  # L2: ±20 % del ancho alrededor del ancla
     _INNER_LL_FRAC       = 0.30  # L1: ventana por lado (ampliado de 0.20 para capturar línea izq en curvas)
-    _HALF_LANE_PX        = 200  # semi-ancho de carril estimado para fallback de una sola línea
+    _HALF_LANE_PX        = 294  # semi-ancho de carril estimado para fallback de una sola línea (calibrado ETS2 Volvo FH16)
     _MAX_GAP_LINEA_PX    = 8
     _MAX_FRAMES_PUNTO_PERDIDO = 15
 

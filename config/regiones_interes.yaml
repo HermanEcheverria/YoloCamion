@@ -1,7 +1,11 @@
 # Regiones de interés calibradas para el Volvo FH16
-# Resolución de referencia: definida al calibrar
+# Resolución de referencia: 1920x1080 (escaladas desde Cabina.png 2559x1599)
 # Formato: [x1, y1, x2, y2] en píxeles
+# Factor de escala aplicado: x*0.7503  y*0.6754
 
-{espejo_der: [1672, 399, 1813, 647], espejo_izq: [102, 346, 385, 825], frente_cercano: [
-    412, 502, 1633, 691], frente_lejano: [282, 231, 1661, 488], lateral_der: [52,
-    177, 1838, 869], lateral_izq: [54, 182, 1836, 868]}
+espejo_izq:     [30,  93,  252, 388]
+espejo_der:     [1647, 90, 1882, 390]
+frente_lejano:  [450, 150, 1250, 430]
+frente_cercano: [482, 461, 1287, 740]
+lateral_izq:    [525, 504,  748, 716]
+lateral_der:    [855, 501, 1131, 702]

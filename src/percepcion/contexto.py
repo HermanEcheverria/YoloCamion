@@ -4,12 +4,51 @@ from pathlib import Path
 from typing import Optional
 import time
 
+import cv2
 import numpy as np
 import yaml
 
 from src.tipos import Clase, EstadoEscena, EstadoSemaforo, Region, Seguimiento
 from src.percepcion.fisica import EstimadorFisicaVisual
 from src.percepcion.semaforo import clasificar_semaforo
+
+# Scanner HSV de respaldo: detecta semáforos en la zona frontal-superior cuando
+# YOLO no los detecta (ETS2 tiene semáforos renderizados que no siempre supera
+# el umbral de confianza del modelo COCO).
+_HSV_SEM_ROJO_1  = (np.array([0,  180, 180]), np.array([8,  255, 255]))
+_HSV_SEM_ROJO_2  = (np.array([172, 180, 180]), np.array([179, 255, 255]))
+_HSV_SEM_AMARILLO = (np.array([18, 180, 180]), np.array([32, 255, 255]))
+_HSV_SEM_VERDE   = (np.array([45, 150, 150]), np.array([85, 255, 255]))
+# Umbral: entre 30 y 3000 px de color → es un foco de semáforo (no ruido ni objeto grande)
+_PX_MIN_SEM = 40    # mínimo para filtrar ruido y píxeles aislados
+_PX_MAX_SEM = 3000  # máximo para excluir objetos grandes (camiones rojos, carteles)
+
+
+def _escanear_semaforo_hsv(imagen: np.ndarray) -> Optional[EstadoSemaforo]:
+    """Busca colores de semáforo en la franja frontal-superior del frame.
+
+    El ROI cubre y=5%-40% del frame: incluye la altura donde aparecen los focos
+    de semáforo (y≈14-35%) y excluye el asfalto de la intersección (y>43%) donde
+    las rayas rojas pintadas causarían falsos positivos permanentes.
+    """
+    h, w = imagen.shape[:2]
+    roi = imagen[int(h * 0.05): int(h * 0.40), int(w * 0.10): int(w * 0.90)]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+    px_r = (cv2.countNonZero(cv2.inRange(hsv, *_HSV_SEM_ROJO_1))
+            + cv2.countNonZero(cv2.inRange(hsv, *_HSV_SEM_ROJO_2)))
+    px_a = cv2.countNonZero(cv2.inRange(hsv, *_HSV_SEM_AMARILLO))
+    px_v = cv2.countNonZero(cv2.inRange(hsv, *_HSV_SEM_VERDE))
+
+    candidatos = {
+        EstadoSemaforo.ROJO:     px_r,
+        EstadoSemaforo.AMARILLO: px_a,
+        EstadoSemaforo.VERDE:    px_v,
+    }
+    ganador, px = max(candidatos.items(), key=lambda x: x[1])
+    if _PX_MIN_SEM <= px <= _PX_MAX_SEM:
+        return ganador
+    return None
 
 _NOMBRE_A_REGION = {
     "frente_cercano": Region.FRENTE_CERCANO,
@@ -137,6 +176,10 @@ class AnalizadorContexto:
                     if ttc < ttc_min:
                         ttc_min = ttc
                         id_critico = seg.id_seguimiento
+
+        # Respaldo HSV: si YOLO no detectó semáforo, escanear la zona frontal por color.
+        if semaforo_estado is None and imagen is not None:
+            semaforo_estado = _escanear_semaforo_hsv(imagen)
 
         n_tracks = len(seguimientos)
         self._historial_tracks.append(n_tracks)
