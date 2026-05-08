@@ -177,6 +177,10 @@ def main():
                         help="Guardar imagen compuesta cada 60 frames: entrada del modelo | máscaras superpuestas")
     parser.add_argument("--debug-clasif-carriles", action="store_true",
                         help="Guardar imagen con clasificación de carriles (ego/contrario/mismo) cada 60 frames")
+    parser.add_argument("--debug-vel", action="store_true",
+                        help="Guardar el ROI del OCR de velocidad cada 30 frames para calibrar _ROI_DIGITOS")
+    parser.add_argument("--mostrar", action="store_true",
+                        help="Mostrar ventana en vivo con detecciones YOLO y estado FSM (reduce ~3 FPS)")
     args = parser.parse_args()
 
     cfg = cargar_config(args.config)
@@ -275,12 +279,12 @@ def main():
         seguimientos = []    # se actualiza cada YOLO_CADA frames
 
         # Control bang-bang sobre OCR: acelera si kmh < objetivo, frena si kmh > objetivo.
-        # Si el OCR no tiene lectura válida → gas suave constante (18% RT).
-        _VEL_OBJETIVO_KMH = 35    # km/h de crucero
-        _BANDA_KMH        = 4     # histéresis ±2 km/h (gas <33, freno >37, coast entre)
-        _GAS_CRUCERO      = 0.22  # 22% RT (~56/255) para acelerar
+        # Si el OCR no tiene lectura válida → gas suave constante (_GAS_CRUCERO).
+        _VEL_OBJETIVO_KMH = 30    # km/h de crucero para ciudad (reducido de 35)
+        _BANDA_KMH        = 4     # histéresis ±2 km/h (gas <28, freno >32, coast entre)
+        _GAS_CRUCERO      = 0.14  # 14% RT (~36/255) — físicamente limita a ~30 km/h sin OCR
         _FRENO_CRUCERO    = 0.22  # 22% LT (~56/255) para frenar suave
-        _EMERGENCIA_KMH   = 55    # freno de emergencia solo si OCR lee claramente > 55
+        _EMERGENCIA_KMH   = 45    # freno de emergencia si OCR lee claramente > 45
         # Cache del último resultado YOLO/FSM — se actualiza cada YOLO_CADA frames
         YOLO_CADA = 3        # YOLO cada 3 frames → ~10 FPS detección, ~30 FPS carril
         yolo_contador = 0
@@ -382,6 +386,36 @@ def main():
                 _vel_estimada = max(0.0, _vel_estimada - 0.001)
             velocidad_actual_norm = _vel_estimada
 
+            if args.debug_vel and n_frame % 30 == 0:
+                import cv2 as _cv2
+                from pathlib import Path as _Path
+                roi_dbg = estimador_velocidad._ultimo_roi_debug
+                if roi_dbg is not None:
+                    # ROI estrecho ampliado ×4 para ver los dígitos exactos
+                    roi_grande = _cv2.resize(roi_dbg, (roi_dbg.shape[1] * 4, roi_dbg.shape[0] * 4),
+                                             interpolation=_cv2.INTER_NEAREST)
+                    ruta_vel = _Path(cfg["registro"]["ruta_base"]) / f"debug_vel_roi_{n_frame:06d}.jpg"
+                    _cv2.imwrite(str(ruta_vel), roi_grande)
+                    # Imagen de contexto: esquina inferior-izquierda (primeros 20% ancho, últimos 25% alto)
+                    # para ver todo el velocímetro y calibrar el ROI
+                    h_f, w_f = cuadro.imagen.shape[:2]
+                    ctx = cuadro.imagen[int(h_f * 0.75):, :int(w_f * 0.20)].copy()
+                    # Dibujar el ROI actual en rojo sobre el contexto
+                    from src.percepcion.velocidad_dashboard import _ROI_DIGITOS as _roi
+                    rx1 = int(round(w_f * _roi[0])) - 0  # ya en coords absolutas
+                    ry1 = int(round(h_f * _roi[1])) - int(h_f * 0.75)
+                    rx2 = int(round(w_f * _roi[2]))
+                    ry2 = int(round(h_f * _roi[3])) - int(h_f * 0.75)
+                    _cv2.rectangle(ctx, (rx1, max(0, ry1)), (min(ctx.shape[1]-1, rx2), max(0, ry2)), (0, 0, 255), 2)
+                    _cv2.putText(ctx, f"kmh={velocidad_actual_kmh if velocidad_actual_kmh is not None else '-'} c={lectura_velocidad.confianza:.2f}",
+                                 (4, 20), _cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+                    ruta_ctx = _Path(cfg["registro"]["ruta_base"]) / f"debug_vel_ctx_{n_frame:06d}.jpg"
+                    _cv2.imwrite(str(ruta_ctx), ctx)
+                    logger.info("OCR ROI guardado: %s | ctx: %s | lectura kmh=%s conf=%.2f",
+                                ruta_vel, ruta_ctx,
+                                "-" if velocidad_actual_kmh is None else str(velocidad_actual_kmh),
+                                lectura_velocidad.confianza)
+
             # ── YOLO + FSM (cada YOLO_CADA frames — lenta ~100ms) ───────────
             yolo_contador += 1
             if yolo_contador >= YOLO_CADA or resultado_cache is None:
@@ -446,7 +480,7 @@ def main():
             elif resultado.estado_nuevo in _ESTADOS_CARRIL and not _fsm_frena:
                 if velocidad_actual_kmh is None:
                     # OCR sin lectura → gas suave hasta que el OCR reporte
-                    setpoint.velocidad_objetivo_norm = 0.18
+                    setpoint.velocidad_objetivo_norm = _GAS_CRUCERO
                     setpoint.freno_objetivo = 0.0
                 elif velocidad_actual_kmh < _VEL_OBJETIVO_KMH - _BANDA_KMH // 2:
                     # Por debajo del objetivo → acelerar
@@ -553,6 +587,84 @@ def main():
                     f"{carriles_clasif.offset_px:+.0f}px" if carriles_clasif.offset_px is not None else "-",
                 )
 
+            # ── Ventana de debug en vivo (--mostrar) ────────────────────────
+            # La ventana se configura como siempre-encima y sin robar foco
+            # (WS_EX_NOACTIVATE) para que el juego mantenga el control del gamepad
+            # al hacer clic sobre ella.
+            if args.mostrar:
+                import cv2 as _cv2
+                _canvas = cuadro.imagen.copy()
+                _color_caja = {
+                    "vehiculo": (0, 165, 255), "motocicleta": (0, 165, 255),
+                    "peaton": (0, 0, 255), "semaforo": (255, 255, 0),
+                    "senal_alto": (0, 255, 255), "desconocido": (128, 128, 128),
+                }
+                _color_accion_disp = {
+                    Accion.ALTO_TOTAL: (0, 0, 255), Accion.FRENAR_FUERTE: (0, 0, 200),
+                    Accion.FRENAR_SUAVE: (0, 165, 255), Accion.MANTENER: (255, 255, 255),
+                    Accion.ACELERAR: (0, 255, 0),
+                }
+                for _seg in seguimientos:
+                    _x1, _y1, _x2, _y2 = _seg.caja
+                    _col = _color_caja.get(_seg.clase.value, (128, 128, 128))
+                    _cv2.rectangle(_canvas, (_x1, _y1), (_x2, _y2), _col, 2)
+                    _ttc_str = ""
+                    if _seg.fisica and _seg.fisica.ttc_segundos < 10:
+                        _ttc_str = f" TTC={_seg.fisica.ttc_segundos:.1f}s"
+                    _lbl = f"{_seg.clase.value}#{_seg.id_seguimiento}{_ttc_str}"
+                    _cv2.putText(_canvas, _lbl, (_x1, max(_y1 - 5, 12)),
+                                 _cv2.FONT_HERSHEY_SIMPLEX, 0.45, _col, 1, _cv2.LINE_AA)
+                _col_a = _color_accion_disp.get(resultado.accion, (255, 255, 255))
+                _cv2.rectangle(_canvas, (0, 0), (500, 105), (0, 0, 0), -1)
+                _cv2.putText(_canvas, f"Accion: {resultado.accion.value}", (8, 28),
+                             _cv2.FONT_HERSHEY_SIMPLEX, 0.85, _col_a, 2, _cv2.LINE_AA)
+                _cv2.putText(_canvas, f"Estado: {resultado.estado_nuevo.value}  R{resultado.regla}", (8, 56),
+                             _cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, _cv2.LINE_AA)
+                _cv2.putText(_canvas, f"R{resultado.regla}: {resultado.razon[:65]}", (8, 80),
+                             _cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, _cv2.LINE_AA)
+                _cv2.putText(_canvas,
+                             f"kmh={velocidad_actual_kmh if velocidad_actual_kmh is not None else '-'}"
+                             f"  FPS={cuadro.fps_instantaneo:.0f}  frm={n_frame}",
+                             (8, 100), _cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 255, 150), 1, _cv2.LINE_AA)
+                _fh, _fw = _canvas.shape[:2]
+                # Escalar a ancho fijo independiente de la resolución capturada
+                _dbg_w = 960
+                _dbg_h = int(_fh * _dbg_w / _fw)
+                _cv2.imshow("YOLO Debug", _cv2.resize(_canvas, (_dbg_w, _dbg_h)))
+                _cv2.waitKey(1)
+
+                # Primera vez: configurar ventana siempre-encima sin robo de foco
+                if n_frame == 1:
+                    import ctypes as _ct
+                    import ctypes.wintypes as _wt
+                    _hwnd = _ct.windll.user32.FindWindowW(None, "YOLO Debug")
+                    if _hwnd:
+                        # WS_EX_NOACTIVATE: clic no roba foco del juego
+                        _GWL_EXSTYLE = -20
+                        _WS_EX_NOACTIVATE = 0x08000000
+                        _st = _ct.windll.user32.GetWindowLongW(_hwnd, _GWL_EXSTYLE)
+                        _ct.windll.user32.SetWindowLongW(_hwnd, _GWL_EXSTYLE, _st | _WS_EX_NOACTIVATE)
+
+                        # Localizar ETS2 para saber dónde posicionar la ventana de debug
+                        _pos_x, _pos_y = 5, 35
+                        _hwnd_ets = _ct.windll.user32.FindWindowW(None, "Euro Truck Simulator 2")
+                        if _hwnd_ets:
+                            _rect = _wt.RECT()
+                            _ct.windll.user32.GetWindowRect(_hwnd_ets, _ct.byref(_rect))
+                            _pos_x = _rect.left + 5
+                            _pos_y = _rect.top + 35  # debajo de la barra de título de ETS2
+                            # ETS2 en modo ventana suele marcarse topmost; quitarle ese flag
+                            # para que nuestra ventana de debug pueda quedar encima.
+                            # HWND_NOTOPMOST=-2, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE
+                            _ct.windll.user32.SetWindowPos(_hwnd_ets, -2, 0, 0, 0, 0, 0x0013)
+
+                        # Poner nuestra ventana encima de todo: HWND_TOPMOST=-1
+                        _ct.windll.user32.SetWindowPos(_hwnd, -1, _pos_x, _pos_y, _dbg_w, _dbg_h, 0x0010)
+                        logger.info(
+                            "Ventana YOLO Debug: %dx%d en (%d,%d)",
+                            _dbg_w, _dbg_h, _pos_x, _pos_y
+                        )
+
             if isinstance(controlador, ControladorGamepadPID):
                 controlador.aplicar(setpoint)
                 if args.debug_carril and n_frame % 30 == 0:
@@ -617,6 +729,9 @@ def main():
         if grabador:
             grabador.cerrar()
         log.cerrar()
+        if args.mostrar:
+            import cv2 as _cv2
+            _cv2.destroyAllWindows()
 
         resumen = metricas.resumen()
         logger.info("=== Sesión terminada ===")

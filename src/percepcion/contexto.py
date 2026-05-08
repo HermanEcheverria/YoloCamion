@@ -19,9 +19,39 @@ _HSV_SEM_ROJO_1  = (np.array([0,  180, 180]), np.array([8,  255, 255]))
 _HSV_SEM_ROJO_2  = (np.array([172, 180, 180]), np.array([179, 255, 255]))
 _HSV_SEM_AMARILLO = (np.array([18, 180, 180]), np.array([32, 255, 255]))
 _HSV_SEM_VERDE   = (np.array([45, 150, 150]), np.array([85, 255, 255]))
-# Umbral: entre 30 y 3000 px de color → es un foco de semáforo (no ruido ni objeto grande)
+# Umbral: entre 40 y 3000 px de color → es un foco de semáforo (no ruido ni objeto grande)
 _PX_MIN_SEM = 40    # mínimo para filtrar ruido y píxeles aislados
 _PX_MAX_SEM = 3000  # máximo para excluir objetos grandes (camiones rojos, carteles)
+# Un blob individual de foco de semáforo no supera ~2000 px² (≈50px de diámetro).
+# Un carro o cartel forma blobs mucho más grandes o muy alargados horizontalmente.
+_BLOB_MAX_FOCO_PX2 = 2000  # px² máximo de un blob individual para ser foco válido
+_BLOB_MAX_RATIO_WH = 3.0   # ancho/alto máximo; >3 → blob alargado (carro, cartel)
+
+
+def _tiene_blob_foco(mascara: np.ndarray) -> bool:
+    """Devuelve True si la máscara tiene al menos un blob pequeño y compacto.
+
+    Un foco de semáforo es aproximadamente circular y pequeño (≤ _BLOB_MAX_FOCO_PX2).
+    Un carro o cartel produce blobs grandes o muy alargados horizontalmente.
+    Si se detecta algún blob válido de foco Y ningún blob demasiado grande domina,
+    se acepta la detección. Si el blob más grande excede el umbral, se rechaza.
+    """
+    n, _, stats, _ = cv2.connectedComponentsWithStats(mascara, connectivity=8)
+    focos_validos = 0
+    for i in range(1, n):
+        area = stats[i, cv2.CC_STAT_AREA]
+        bw = stats[i, cv2.CC_STAT_WIDTH]
+        bh = max(stats[i, cv2.CC_STAT_HEIGHT], 1)
+        if area < 20:
+            continue
+        # Blob grande → objeto (carro, cartel, edificio), no un foco de semáforo
+        if area > _BLOB_MAX_FOCO_PX2:
+            return False
+        # Blob muy alargado horizontalmente → carro o panel publicitario
+        if (bw / bh) > _BLOB_MAX_RATIO_WH:
+            return False
+        focos_validos += 1
+    return focos_validos > 0
 
 
 def _escanear_semaforo_hsv(imagen: np.ndarray) -> Optional[EstadoSemaforo]:
@@ -30,25 +60,42 @@ def _escanear_semaforo_hsv(imagen: np.ndarray) -> Optional[EstadoSemaforo]:
     El ROI cubre y=5%-40% del frame: incluye la altura donde aparecen los focos
     de semáforo (y≈14-35%) y excluye el asfalto de la intersección (y>43%) donde
     las rayas rojas pintadas causarían falsos positivos permanentes.
+
+    Para rojo y amarillo aplica análisis morfológico de blobs para descartar
+    objetos grandes (carros, carteles) que comparten colores con los semáforos.
     """
     h, w = imagen.shape[:2]
     roi = imagen[int(h * 0.05): int(h * 0.40), int(w * 0.10): int(w * 0.90)]
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
-    px_r = (cv2.countNonZero(cv2.inRange(hsv, *_HSV_SEM_ROJO_1))
-            + cv2.countNonZero(cv2.inRange(hsv, *_HSV_SEM_ROJO_2)))
-    px_a = cv2.countNonZero(cv2.inRange(hsv, *_HSV_SEM_AMARILLO))
-    px_v = cv2.countNonZero(cv2.inRange(hsv, *_HSV_SEM_VERDE))
+    mascara_r = cv2.bitwise_or(
+        cv2.inRange(hsv, *_HSV_SEM_ROJO_1),
+        cv2.inRange(hsv, *_HSV_SEM_ROJO_2),
+    )
+    mascara_a = cv2.inRange(hsv, *_HSV_SEM_AMARILLO)
+    mascara_v = cv2.inRange(hsv, *_HSV_SEM_VERDE)
+
+    px_r = cv2.countNonZero(mascara_r)
+    px_a = cv2.countNonZero(mascara_a)
+    px_v = cv2.countNonZero(mascara_v)
 
     candidatos = {
-        EstadoSemaforo.ROJO:     px_r,
-        EstadoSemaforo.AMARILLO: px_a,
-        EstadoSemaforo.VERDE:    px_v,
+        EstadoSemaforo.ROJO:     (px_r, mascara_r),
+        EstadoSemaforo.AMARILLO: (px_a, mascara_a),
+        EstadoSemaforo.VERDE:    (px_v, mascara_v),
     }
-    ganador, px = max(candidatos.items(), key=lambda x: x[1])
-    if _PX_MIN_SEM <= px <= _PX_MAX_SEM:
-        return ganador
-    return None
+    ganador, (px, mascara) = max(candidatos.items(), key=lambda x: x[1][0])
+    if not (_PX_MIN_SEM <= px <= _PX_MAX_SEM):
+        return None
+
+    # Para rojo y amarillo verificar que los píxeles forman focos compactos.
+    # Verde tiene menos falsos positivos en ciudad (edificios, árboles no pasan
+    # los umbrales de saturación altos de _HSV_SEM_VERDE).
+    if ganador in (EstadoSemaforo.ROJO, EstadoSemaforo.AMARILLO):
+        if not _tiene_blob_foco(mascara):
+            return None
+
+    return ganador
 
 _NOMBRE_A_REGION = {
     "frente_cercano": Region.FRENTE_CERCANO,
@@ -82,7 +129,7 @@ _ROI_DEFAULT: dict[Region, tuple[int, int, int, int]] = {
     Region.LATERAL_DER:    (1440, 400, 1920,  900),
 }
 
-_AREA_MIN_FRENTE = 5000   # px² para considerar vehículo relevante en frente cercano
+_AREA_MIN_FRENTE = 2500   # px² para considerar vehículo relevante en frente cercano
 _AREA_MIN_ESPEJO = 2000
 _AREA_MIN_PEATON = 3000   # peatón muy pequeño = falso positivo (HUD, árbol, poste)
 

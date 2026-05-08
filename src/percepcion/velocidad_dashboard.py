@@ -18,7 +18,13 @@ class LecturaVelocidadDashboard:
     valido: bool
 
 
-_ROI_DIGITOS = (0.0474, 0.9287, 0.0781, 0.9722)  # x1, y1, x2, y2 — solo digitos velocimetro ETS2 1920x1080
+# ROI del display digital interno del velocímetro analógico del Volvo FH16.
+# El dial analógico tiene marcas "0,10,15,20" impresas en el borde — el OCR las leía
+# como velocidad actual ("20" siempre visible). El display DIGITAL dentro del círculo
+# del dial muestra la velocidad exacta en texto y está más a la izquierda y más arriba
+# que las marcas del borde.
+# Ajustar con --debug-vel si los dígitos no quedan bien encuadrados.
+_ROI_DIGITOS = (0.0427, 0.9222, 0.0813, 0.9731)  # x1, y1, x2, y2 — solo digitos velocimetro ETS2 1920x1080
 _SIZE_ROI = (80, 45)  # ancho, alto de referencia
 _SIZE_DIGITO = (10, 14)
 
@@ -196,13 +202,14 @@ _PLANTILLAS = {digito: _plantilla(bits) for digito, bits in _DIGITOS_ASCII.items
 
 
 class EstimadorVelocidadDashboard:
-    """Lee km/h del HUD inferior izquierdo y lo normaliza a [0, 1]."""
+    """Lee km/h del panel de navegación y lo normaliza a [0, 1]."""
 
     def __init__(self, max_kmh_norm: float = 90.0, retener_frames: int = 15) -> None:
         self._max_kmh_norm = max(1.0, float(max_kmh_norm))
         self._retener_frames = max(0, int(retener_frames))
         self._ultimo_kmh: int | None = None
         self._frames_sin_lectura = 0
+        self._ultimo_roi_debug: np.ndarray | None = None  # ROI crudo para debug
 
     def estimar(self, frame_bgr: np.ndarray) -> LecturaVelocidadDashboard:
         lectura = self.leer(frame_bgr)
@@ -275,6 +282,7 @@ class EstimadorVelocidadDashboard:
         x2 = max(x1 + 1, min(w, int(round(w * x2f))))
         y2 = max(y1 + 1, min(h, int(round(h * y2f))))
         roi = frame_bgr[y1:y2, x1:x2]
+        self._ultimo_roi_debug = roi.copy()  # para guardar con --debug-vel
         return cv2.resize(roi, _SIZE_ROI, interpolation=cv2.INTER_AREA)
 
     def _extraer_componentes(self, mask: np.ndarray) -> list[tuple[int, np.ndarray]]:

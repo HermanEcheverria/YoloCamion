@@ -19,9 +19,11 @@ from src.decision.estado import EstadoFSM
 _N_FRAMES_OCUPADO = 4   # frames consecutivos para declarar "ocupado" (~0.4s a 10 FPS YOLO)
 _N_FRAMES_LIBRE   = 18  # frames consecutivos para declarar "libre" (~1.8s a 10 FPS YOLO)
                         # Aumentado de 10 para reducir ciclado R8/R4 por detecciones espurias
-_N_FRAMES_LIBRE_SEMAFORO = 126  # ~9s a 14fps: el semáforo puede salir del FOV al frenar
-                                # bruscamente; el camión permanece detenido hasta que
-                                # se detecte VERDE o pasen ~9s sin ver ROJO
+_N_FRAMES_LIBRE_SEMAFORO = 45   # ~3s a 15fps: tiempo sin ver ROJO para salida por timeout
+                                # (reducido de 126: falsos positivos rojos —vehículos, señales—
+                                # reiniciaban el contador y dejaban el camión trabado ~9s)
+_T_MAX_DETENIDO_SEMAFORO = 20.0 # s: salida forzada si llevamos más de esto detenidos por semáforo
+                                 # (failsafe contra ciclos de falsos rojos que bloquean la FSM)
 _T_ESPERA_ALTO    = 2.0  # segundos de parada completa antes de cruzar
 _T_MIN_SIGUIENDO  = 8.0  # segundos mínimos siguiendo antes de evaluar rebase
 
@@ -110,6 +112,7 @@ class FSMDecision:
         # Timers
         self._t_inicio_alto: Optional[float] = None
         self._t_siguiendo_desde: Optional[float] = None
+        self._t_detenido_semaforo_inicio: Optional[float] = None
 
     def activar_paro_manual(self) -> None:
         self._paro_manual = True
@@ -178,20 +181,29 @@ class FSMDecision:
             )
 
         # Regla 4 — Semáforo rojo → detenerse (RF-07)
-        # Stickiness larga: al frenar bruscamente el semáforo puede salir del FOV
-        # antes de ponerse verde (el camión sobrepasa la línea de parada).
-        # Permanecemos en DETENIDO_SEMAFORO hasta que:
-        #   a) se detecte VERDE activo  (escape rápido cuando sí lo vemos), o
-        #   b) pasen _N_FRAMES_LIBRE_SEMAFORO frames sin ROJO (~9s a 14fps)
+        # Tres rutas de escape desde DETENIDO_SEMAFORO:
+        #   a) VERDE activo ≥2 frames consecutivos  (detección directa)
+        #   b) _N_FRAMES_LIBRE_SEMAFORO frames sin ROJO (~3s)  (semáforo fuera de FOV)
+        #   c) _T_MAX_DETENIDO_SEMAFORO segundos en estado (failsafe anti-trabado)
+        if self._estado == EstadoFSM.DETENIDO_SEMAFORO:
+            if self._t_detenido_semaforo_inicio is None:
+                self._t_detenido_semaforo_inicio = time.monotonic()
+        else:
+            self._t_detenido_semaforo_inicio = None
+        _tiempo_detenido = (
+            time.monotonic() - self._t_detenido_semaforo_inicio
+            if self._t_detenido_semaforo_inicio is not None else 0.0
+        )
         _semaforo_rojo_sticky = self._c_semaforo_rojo.esta_activo() or (
             self._estado == EstadoFSM.DETENIDO_SEMAFORO
             and self._c_semaforo_rojo.n_negativos < _N_FRAMES_LIBRE_SEMAFORO
-            and not self._c_semaforo_verde.esta_activo()
+            and not self._c_semaforo_verde.esta_activo(umbral=2)
+            and _tiempo_detenido < _T_MAX_DETENIDO_SEMAFORO
         )
         if _semaforo_rojo_sticky:
             return ResultadoDecision(
                 Accion.ALTO_TOTAL, EstadoFSM.DETENIDO_SEMAFORO,
-                4, "semáforo en ROJO"
+                4, f"semáforo en ROJO (neg={self._c_semaforo_rojo.n_negativos}/{_N_FRAMES_LIBRE_SEMAFORO} t={_tiempo_detenido:.1f}s)"
             )
 
         # Regla 5 — Semáforo amarillo → frenar suave si no estamos detenidos
@@ -274,6 +286,17 @@ class FSMDecision:
             return ResultadoDecision(
                 Accion.MANTENER, EstadoFSM.SIGUIENDO_VEHICULO,
                 8, f"frente ocupado pero TTC={ttc:.2f}s alto, manteniendo distancia"
+            )
+
+        # Regla 8.5 — Vehículo en frente lejano con TTC bajo → frenar preventivo.
+        # Cubre el caso de un carro parado en semáforo que aún no alcanza la ROI
+        # de frente cercano (demasiado lejos o área < _AREA_MIN_FRENTE). Sin esta
+        # regla, el camión no reacciona hasta que el objeto entra al frente cercano
+        # o el TTC cae por debajo de 1.5 s (R3.5), que puede ser demasiado tarde.
+        if self._c_frente_lejano.esta_activo() and ttc < _TTC_FRENO_SUAVE:
+            return ResultadoDecision(
+                Accion.FRENAR_SUAVE, EstadoFSM.FRENANDO_PREVENTIVO,
+                85, f"frente lejano TTC={ttc:.2f}s → frenar preventivo"
             )
 
         # Regla 11 — Semáforo verde y frente libre → avanzar (RF-06)
